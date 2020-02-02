@@ -1,0 +1,38 @@
+CREATE KEYSPACE balboa WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 2};
+USE balboa;
+
+CREATE TABLE observations_by_rdata (
+    rrname text,
+    rdata text,
+    rrtype text,
+    sensor_id text,
+    last_seen timestamp,
+    PRIMARY KEY ((rdata), rrname, rrtype, sensor_id)
+);
+
+CREATE TABLE observations_by_rrname (
+    rrname text,
+    rdata text,
+    rrtype text,
+    sensor_id text,
+    last_seen timestamp,
+    PRIMARY KEY ((rrname), rdata, rrtype, sensor_id)
+);
+
+CREATE TABLE observations_firstseen (
+    rrname text,
+    rdata text,
+    rrtype text,
+    sensor_id text,
+    first_seen timestamp,
+    PRIMARY KEY ((rrname, rdata, rrtype, sensor_id))
+);
+
+CREATE TABLE observations_counts (
+    rrname text,
+    rdata text,
+    rrtype text,
+    sensor_id text,
+    count counter,
+    PRIMARY KEY ((rrname, rdata, rrtype, sensor_id))
+);
