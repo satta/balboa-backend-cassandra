@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxChunk   = 500
+	maxChunk   = 5000
 	timeFormat = "2006-01-02T15:04:05Z"
 )
 
@@ -67,37 +67,40 @@ func MakeCassandraHandler(hosts []string, username, password string, nofWorkers 
 }
 
 func (db *CassandraHandler) runChunkWorker() {
-	rdataUpd := db.Session.Query(`UPDATE observations_by_rdata SET last_seen = ? where rdata = ? and rrname = ?  and rrtype = ? and sensor_id = ?;`)
-	rrnameUpd := db.Session.Query(`UPDATE observations_by_rrname SET last_seen = ? where rrname = ? and rdata = ? and rrtype = ? and sensor_id = ?;`)
-	firstseenUpd := db.Session.Query(`INSERT INTO observations_firstseen (first_seen, rrname, rdata, rrtype, sensor_id) values (?, ?, ?, ?, ?) IF NOT EXISTS;`)
-	countsUpd := db.Session.Query(`UPDATE observations_counts SET count = count + ? where rdata = ? and rrname = ? and rrtype = ? and sensor_id = ?;`)
+
 	for chunk := range db.SendChan {
 		select {
 		case <-db.StopChan:
 			log.Info("database ingest terminated")
 			return
 		default:
+			log.Info("started...")
+			sTime := time.Now()
+			b1 := db.Session.NewBatch(gocql.UnloggedBatch)
+			b2 := db.Session.NewBatch(gocql.UnloggedBatch)
+			b3 := db.Session.NewBatch(gocql.CounterBatch)
 			for _, obs := range chunk {
 				if obs.Rdata == "" {
 					obs.Rdata = "-"
 				}
-				if err := rdataUpd.Bind(obs.TimestampEnd, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-					log.Error(err)
-					continue
-				}
-				if err := rrnameUpd.Bind(obs.TimestampEnd, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-					log.Error(err)
-					continue
-				}
-				if err := firstseenUpd.Bind(obs.TimestampStart, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-					log.Error(err)
-					continue
-				}
-				if err := countsUpd.Bind(obs.Count, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-					log.Error(err)
-					continue
-				}
+				b1.Query(`UPDATE observations_by_rdata SET last_seen = ? where rdata = ? and rrname = ?  and rrtype = ? and sensor_id = ?;`, obs.TimestampEnd, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID)
+				b1.Query(`UPDATE observations_by_rrname SET last_seen = ? where rrname = ? and rdata = ? and rrtype = ? and sensor_id = ?;`, obs.TimestampEnd, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID)
+				b2.Query(`INSERT INTO observations_firstseen (first_seen, rrname, rdata, rrtype, sensor_id) values (?, ?, ?, ?, ?) IF NOT EXISTS;`, obs.TimestampStart, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID)
+				b3.Query(`UPDATE observations_counts SET count = count + ? where rdata = ? and rrname = ? and rrtype = ? and sensor_id = ?;`, obs.Count, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID)
 			}
+			err := db.Session.ExecuteBatch(b1)
+			if err != nil {
+				log.Error("b1: ", err)
+			}
+			err = db.Session.ExecuteBatch(b2)
+			if err != nil {
+				log.Error("b2: ", err)
+			}
+			err = db.Session.ExecuteBatch(b3)
+			if err != nil {
+				log.Error("b3: ", err)
+			}
+			log.Info("finished, took ", time.Since(sTime))
 		}
 	}
 }
