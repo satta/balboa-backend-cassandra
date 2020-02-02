@@ -4,7 +4,7 @@ package handler
 // 	t.Skip("skipping Cassandra tests due to removed gockle support")
 // 	db, m := makeCassandraDBMock()
 // 	defer db.Shutdown()
-
+s
 // 	inChan := make(chan observation.InputObservation)
 // 	stopChan := make(chan bool)
 

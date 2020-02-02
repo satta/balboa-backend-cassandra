@@ -7,6 +7,7 @@ import (
 
 	"github.com/DCSO/balboa/db"
 	"github.com/DCSO/balboa/observation"
+
 	"github.com/gocql/gocql"
 	log "github.com/sirupsen/logrus"
 )
@@ -17,22 +18,25 @@ const (
 )
 
 // CassandraDB is a DB implementation based on Apache Cassandra.
-type CassandraDB struct {
-	Cluster  *gocql.ClusterConfig
-	Session  *gocql.Session
-	StopChan chan bool
-	Nworkers uint
+type CassandraHandler struct {
+	Cluster      *gocql.ClusterConfig
+	Session      *gocql.Session
+	StopChan     chan bool
+	SendChan     chan []observation.InputObservation
+	CurBuffer    []observation.InputObservation
+	CurBufferPos int
+	Nworkers     int
 }
 
-// MakeCassandraDB returns a new CassandraDB instance connecting to the
+// MakeCassandraHandler returns a new CassandraHandler instance connecting to the
 // provided hosts.
-func MakeCassandraDB(hosts []string, username, password string, nofWorkers uint) (*CassandraDB, error) {
+func MakeCassandraHandler(hosts []string, username, password string, nofWorkers int) (*CassandraHandler, error) {
 	cluster := gocql.NewCluster(hosts...)
 	cluster.Keyspace = "balboa"
 	cluster.ProtoVersion = 4
 	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
 	cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{NumRetries: 5}
-	cluster.Consistency = gocql.Two
+	cluster.Consistency = gocql.Quorum
 	if len(username) > 0 && len(password) > 0 {
 		cluster.Authenticator = gocql.PasswordAuthenticator{
 			Username: username,
@@ -44,88 +48,63 @@ func MakeCassandraDB(hosts []string, username, password string, nofWorkers uint)
 		return nil, err
 	}
 	//session := gockle.NewSession(gsession)
-	db := &CassandraDB{
-		Cluster:  cluster,
-		Session:  gsession,
-		StopChan: make(chan bool),
-		Nworkers: nofWorkers,
+	db := &CassandraHandler{
+		Cluster:      cluster,
+		Session:      gsession,
+		StopChan:     make(chan bool),
+		SendChan:     make(chan []observation.InputObservation, 100),
+		CurBufferPos: 0,
+		CurBuffer:    make([]observation.InputObservation, maxChunk),
+		Nworkers:     nofWorkers,
 	}
+
+	log.Debugf("Firing up %d workers", db.Nworkers)
+	for i := 1; i <= db.Nworkers; i++ {
+		go db.runChunkWorker()
+	}
+
 	return db, nil
 }
 
-//func makeCassandraDBMock() (*CassandraDB, *gockle.SessionMock) {
-//	mock := &gockle.SessionMock{}
-//	db := &CassandraDB{
-//		//Session:  mock,
-//		StopChan: make(chan bool),
-//	}
-//	return db, mock
-//}
-
-// AddObservation adds a single observation synchronously to the database.
-func (db *CassandraDB) AddObservation(obs observation.InputObservation) observation.Observation {
-	//Not implemented
-	log.Warn("AddObservation() not yet implemented on Cassandra backend")
-	return observation.Observation{}
-}
-
-func (db *CassandraDB) runChunkWorker(inChan chan observation.InputObservation) {
+func (db *CassandraHandler) runChunkWorker() {
 	rdataUpd := db.Session.Query(`UPDATE observations_by_rdata SET last_seen = ? where rdata = ? and rrname = ?  and rrtype = ? and sensor_id = ?;`)
 	rrnameUpd := db.Session.Query(`UPDATE observations_by_rrname SET last_seen = ? where rrname = ? and rdata = ? and rrtype = ? and sensor_id = ?;`)
 	firstseenUpd := db.Session.Query(`INSERT INTO observations_firstseen (first_seen, rrname, rdata, rrtype, sensor_id) values (?, ?, ?, ?, ?) IF NOT EXISTS;`)
 	countsUpd := db.Session.Query(`UPDATE observations_counts SET count = count + ? where rdata = ? and rrname = ? and rrtype = ? and sensor_id = ?;`)
-	for obs := range inChan {
+	for chunk := range db.SendChan {
 		select {
 		case <-db.StopChan:
 			log.Info("database ingest terminated")
 			return
 		default:
-			if obs.Rdata == "" {
-				obs.Rdata = "-"
+			for _, obs := range chunk {
+				if obs.Rdata == "" {
+					obs.Rdata = "-"
+				}
+				if err := rdataUpd.Bind(obs.TimestampEnd, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
+					log.Error(err)
+					continue
+				}
+				if err := rrnameUpd.Bind(obs.TimestampEnd, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
+					log.Error(err)
+					continue
+				}
+				if err := firstseenUpd.Bind(obs.TimestampStart, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
+					log.Error(err)
+					continue
+				}
+				if err := countsUpd.Bind(obs.Count, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
+					log.Error(err)
+					continue
+				}
 			}
-			if err := rdataUpd.Bind(obs.TimestampEnd, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-				log.Error(err)
-				continue
-			}
-			if err := rrnameUpd.Bind(obs.TimestampEnd, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-				log.Error(err)
-				continue
-			}
-			if err := firstseenUpd.Bind(obs.TimestampStart, obs.Rrname, obs.Rdata, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-				log.Error(err)
-				continue
-			}
-			if err := countsUpd.Bind(obs.Count, obs.Rdata, obs.Rrname, obs.Rrtype, obs.SensorID).Exec(); err != nil {
-				log.Error(err)
-				continue
-			}
-		}
-	}
-}
-
-// ConsumeFeed accepts observations from a channel and queues them for
-// database insertion.
-func (db *CassandraDB) ConsumeFeed(inChan chan observation.InputObservation) {
-	var w uint
-	sendChan := make(chan observation.InputObservation, 500)
-	log.Debugf("Firing up %d workers", db.Nworkers)
-	for w = 1; w <= db.Nworkers; w++ {
-		go db.runChunkWorker(sendChan)
-	}
-	for {
-		select {
-		case <-db.StopChan:
-			log.Info("database ingest terminated")
-			return
-		case obs := <-inChan:
-			sendChan <- obs
 		}
 	}
 }
 
 // Search returns a slice of observations matching one or more criteria such
 // as rdata, rrname, rrtype or sensor ID.
-func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]observation.Observation, error) {
+func (db *CassandraHandler) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]observation.Observation, error) {
 	outs := make([]observation.Observation, 0)
 	var getQueryString string
 	var rdataFirst, hasSecond bool
@@ -180,7 +159,7 @@ func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]ob
 
 		if rrnameV, ok := row["rrname"]; ok {
 			var rdata, rrname, rrtype, sensorID string
-			var lastSeen int
+			var lastSeen time.Time
 			rrname = rrnameV.(string)
 			if rdataV, ok := row["rdata"]; ok {
 				rdata = rdataV.(string)
@@ -199,7 +178,8 @@ func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]ob
 					}
 				}
 				if lastSeenV, ok := row["last_seen"]; ok {
-					lastSeen = int(lastSeenV.(time.Time).Unix())
+					// XXX: check
+					lastSeen = lastSeenV.(time.Time)
 				}
 
 				// we now have a result item
@@ -219,7 +199,7 @@ func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]ob
 					log.Errorf("getCount: %s", err.Error())
 					continue
 				}
-				out.Count = int(tmpMap["count"].(int64))
+				out.Count = uint(tmpMap["count"].(int64))
 
 				tmpMap = make(map[string]interface{})
 				getFirstSeen := db.Session.Query(`SELECT first_seen FROM observations_firstseen WHERE rrname = ? AND rdata = ? AND rrtype = ? AND sensor_id = ?`).Bind(rrname, rdata, rrtype, sensorID)
@@ -228,7 +208,8 @@ func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]ob
 					log.Errorf("getFirstSeen: %s", err.Error())
 					continue
 				}
-				out.FirstSeen = int(tmpMap["first_seen"].(int64))
+				// XXX: check
+				out.FirstSeen = tmpMap["first_seen"].(time.Time)
 
 				outs = append(outs, out)
 			} else {
@@ -243,15 +224,9 @@ func (db *CassandraDB) Search(qrdata, qrrname, qrrtype, qsensorID *string) ([]ob
 	return outs, nil
 }
 
-// TotalCount returns the overall number of observations across all sensors.
-func (db *CassandraDB) TotalCount() (int, error) {
-	// TODO
-	return 0, nil
-}
-
 // Shutdown closes the database connection, leaving the database unable to
 // process both reads and writes.
-func (db *CassandraDB) Shutdown() {
+func (db *CassandraHandler) Shutdown() {
 	close(db.StopChan)
 	if db.Session != nil {
 		db.Session.Close()
@@ -259,13 +234,22 @@ func (db *CassandraDB) Shutdown() {
 }
 
 // HandleObservations processes a single observation for insertion.
-func (d *DgraphHandler) HandleObservations(obs *observation.InputObservation) {
-
+func (d *CassandraHandler) HandleObservations(obs *observation.InputObservation) {
+	if d.CurBufferPos < maxChunk {
+		d.CurBuffer[d.CurBufferPos] = *obs
+		d.CurBufferPos++
+	} else {
+		myBuf := d.CurBuffer
+		d.CurBuffer = make([]observation.InputObservation, maxChunk)
+		d.SendChan <- myBuf
+		d.CurBufferPos = 0
+		log.Infof("sent chunk of %d", maxChunk)
+	}
 }
 
 // HandleQuery implements a query for a combination of parameters.
-func (d *DgraphHandler) HandleQuery(qr *db.QueryRequest, conn net.Conn) {
-
+func (d *CassandraHandler) HandleQuery(qr *db.QueryRequest, conn net.Conn) {
+	enc := db.MakeEncoder()
 	endRes, err := enc.EncodeQueryStreamEndResponse()
 	if err != nil {
 		log.Error(err)
@@ -274,7 +258,7 @@ func (d *DgraphHandler) HandleQuery(qr *db.QueryRequest, conn net.Conn) {
 }
 
 // HandleDump is not implemented yet.
-func (d *DgraphHandler) HandleDump(dr *db.DumpRequest, conn net.Conn) {
+func (d *CassandraHandler) HandleDump(dr *db.DumpRequest, conn net.Conn) {
 	enc := db.MakeEncoder()
 	errRes, err := enc.EncodeErrorResponse(db.ErrorResponse{
 		Message: fmt.Sprintf("dump to %s not supported yet", dr.Path),
@@ -286,6 +270,6 @@ func (d *DgraphHandler) HandleDump(dr *db.DumpRequest, conn net.Conn) {
 }
 
 // HandleBackup is not implemented yet.
-func (d *DgraphHandler) HandleBackup(br *db.BackupRequest) {
+func (d *CassandraHandler) HandleBackup(br *db.BackupRequest) {
 	log.Error("backup not supported yet")
 }
